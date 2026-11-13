@@ -1,10 +1,12 @@
 """Kaggle T4 x2 GPU Worker for Stickman Hybrid Studio.
-Exposes /health, /generate-image (SDXL-Turbo), and /generate-video (LTX-Video / Wan I2V).
+Uses async background jobs for /generate-video so Cloudflare Tunnel (100s timeout) never returns 524.
 """
 import base64
 import io
 import os
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,7 @@ API_KEY = os.environ.get("STICKMAN_API_KEY", "").strip()
 _IMG_PIPE = None
 _VID_PIPE = None
 _VID_MODEL_ID = None
+_VIDEO_JOBS: dict[str, dict] = {}
 
 
 def _auth(x_api_key: Optional[str]) -> None:
@@ -44,7 +47,6 @@ def _get_video_pipe(model_choice: str):
     if _VID_PIPE is not None and _VID_MODEL_ID == model_choice:
         return _VID_PIPE
 
-    # Free previous video pipeline if switching
     if _VID_PIPE is not None:
         del _VID_PIPE
         torch.cuda.empty_cache()
@@ -104,11 +106,13 @@ def generate_image(req: ImageReq, x_api_key: Optional[str] = Header(default=None
     _auth(x_api_key)
     pipe = _get_image_pipe()
     gen = torch.Generator("cuda").manual_seed(req.seed)
+    w = (req.width // 64) * 64
+    h = (req.height // 64) * 64
     img = pipe(
         prompt=req.prompt,
         negative_prompt=req.negative_prompt,
-        width=req.width,
-        height=req.height,
+        width=w,
+        height=h,
         num_inference_steps=4,
         guidance_scale=0.0,
         generator=gen,
@@ -118,32 +122,54 @@ def generate_image(req: ImageReq, x_api_key: Optional[str] = Header(default=None
     return {"image_base64": base64.b64encode(buf.getvalue()).decode("ascii")}
 
 
+def _run_video_worker(job_id: str, req: VideoReq) -> None:
+    try:
+        from diffusers.utils import export_to_video
+
+        w = max(384, min(512, (req.width // 32) * 32))
+        h = max(384, min(768, (req.height // 32) * 32))
+        raw_img = Image.open(io.BytesIO(base64.b64decode(req.image_base64))).convert("RGB")
+        raw_img = raw_img.resize((w, h))
+
+        pipe = _get_video_pipe(req.model)
+        gen = torch.Generator("cpu").manual_seed(req.seed)
+        num_frames = 65 if req.model == "ltx-video" else 49
+        fps = 8 if req.model == "ltx-video" else 12
+
+        out = pipe(
+            image=raw_img,
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            width=w,
+            height=h,
+            num_frames=num_frames,
+            num_inference_steps=20,
+            generator=gen,
+        )
+        frames = out.frames[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4_path = Path(tmp) / "clip.mp4"
+            export_to_video(frames, str(mp4_path), fps=fps)
+            b64 = base64.b64encode(mp4_path.read_bytes()).decode("ascii")
+
+        _VIDEO_JOBS[job_id] = {"status": "done", "video_base64": b64}
+    except Exception as exc:
+        _VIDEO_JOBS[job_id] = {"status": "error", "error": str(exc)}
+
+
 @app.post("/generate-video")
 def generate_video(req: VideoReq, x_api_key: Optional[str] = Header(default=None)):
     _auth(x_api_key)
-    from diffusers.utils import export_to_video
+    job_id = uuid.uuid4().hex[:12]
+    _VIDEO_JOBS[job_id] = {"status": "running"}
+    t = threading.Thread(target=_run_video_worker, args=(job_id, req), daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "running"}
 
-    raw_img = Image.open(io.BytesIO(base64.b64decode(req.image_base64))).convert("RGB")
-    raw_img = raw_img.resize((req.width, req.height))
 
-    pipe = _get_video_pipe(req.model)
-    gen = torch.Generator("cpu").manual_seed(req.seed)
-    num_frames = 97 if req.model == "ltx-video" else 81
-    fps = 10 if req.model == "ltx-video" else 16
-
-    out = pipe(
-        image=raw_img,
-        prompt=req.prompt,
-        negative_prompt=req.negative_prompt,
-        width=req.width,
-        height=req.height,
-        num_frames=num_frames,
-        num_inference_steps=28,
-        generator=gen,
-    )
-    frames = out.frames[0]
-    with tempfile.TemporaryDirectory() as tmp:
-        mp4_path = Path(tmp) / "clip.mp4"
-        export_to_video(frames, str(mp4_path), fps=fps)
-        b64 = base64.b64encode(mp4_path.read_bytes()).decode("ascii")
-    return {"video_base64": b64}
+@app.get("/video-jobs/{job_id}")
+def get_video_job(job_id: str, x_api_key: Optional[str] = Header(default=None)):
+    _auth(x_api_key)
+    if job_id not in _VIDEO_JOBS:
+        raise HTTPException(status_code=404, detail="Video job not found")
+    return _VIDEO_JOBS[job_id]
