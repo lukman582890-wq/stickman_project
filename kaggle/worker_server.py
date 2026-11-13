@@ -1,5 +1,6 @@
-"""Kaggle T4 x2 GPU Worker for Stickman Hybrid Studio.
-Uses async background jobs for /generate-video + aggressive VRAM offloading for 15GB T4.
+"""Kaggle T4 x2 GPU Worker (v2.1) for Stickman Hybrid Studio.
+- Async background jobs for /generate-video (avoids Cloudflare 524 timeout)
+- Uses GPU 1 (cuda:1) or sequential CPU offload for LTX-Video so SDXL-Turbo and LTX-Video never OOM
 """
 import base64
 import gc
@@ -18,13 +19,15 @@ from fastapi import FastAPI, Header, HTTPException
 from PIL import Image
 from pydantic import BaseModel
 
-app = FastAPI(title="Stickman Kaggle GPU Worker")
+WORKER_VERSION = "2.1-multi-gpu-offload"
+app = FastAPI(title="Stickman Kaggle GPU Worker", version=WORKER_VERSION)
 
 API_KEY = os.environ.get("STICKMAN_API_KEY", "").strip()
 _IMG_PIPE = None
 _VID_PIPE = None
 _VID_MODEL_ID = None
 _VIDEO_JOBS: dict[str, dict] = {}
+_LOCK = threading.Lock()
 
 
 def _auth(x_api_key: Optional[str]) -> None:
@@ -35,17 +38,36 @@ def _auth(x_api_key: Optional[str]) -> None:
 def _free_vram() -> None:
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
-def _get_image_pipe():
-    global _IMG_PIPE, _VID_PIPE, _VID_MODEL_ID
+def _unload_image_pipe() -> None:
+    global _IMG_PIPE
+    if _IMG_PIPE is not None:
+        try:
+            _IMG_PIPE.to("cpu")
+        except Exception:
+            pass
+        del _IMG_PIPE
+        _IMG_PIPE = None
+        _free_vram()
+
+
+def _unload_video_pipe() -> None:
+    global _VID_PIPE, _VID_MODEL_ID
     if _VID_PIPE is not None:
         del _VID_PIPE
         _VID_PIPE = None
         _VID_MODEL_ID = None
         _free_vram()
 
+
+def _get_image_pipe():
+    global _IMG_PIPE
+    _unload_video_pipe()
     if _IMG_PIPE is None:
         from diffusers import AutoPipelineForText2Image
         _IMG_PIPE = AutoPipelineForText2Image.from_pretrained(
@@ -53,22 +75,18 @@ def _get_image_pipe():
             torch_dtype=torch.float16,
             variant="fp16",
         )
-    _IMG_PIPE.to("cuda")
+        _IMG_PIPE.to("cuda:0")
     return _IMG_PIPE
 
 
 def _get_video_pipe(model_choice: str):
-    global _IMG_PIPE, _VID_PIPE, _VID_MODEL_ID
-    if _IMG_PIPE is not None:
-        _IMG_PIPE.to("cpu")
-        _free_vram()
+    global _VID_PIPE, _VID_MODEL_ID
+    _unload_image_pipe()
 
     if _VID_PIPE is not None and _VID_MODEL_ID == model_choice:
         return _VID_PIPE
 
-    if _VID_PIPE is not None:
-        del _VID_PIPE
-        _free_vram()
+    _unload_video_pipe()
 
     if model_choice == "wan2.1-i2v":
         from diffusers import WanImageToVideoPipeline
@@ -83,6 +101,7 @@ def _get_video_pipe(model_choice: str):
             torch_dtype=torch.float16,
         )
 
+    # Sequential offload keeps peak VRAM under ~6 GB on a 15 GB T4
     pipe.enable_sequential_cpu_offload()
     if hasattr(pipe, "vae"):
         if hasattr(pipe.vae, "enable_tiling"):
@@ -110,7 +129,7 @@ class VideoReq(BaseModel):
     negative_prompt: str = ""
     width: int = 512
     height: int = 896
-    duration_sec: int = 10
+    duration_sec: float = 4.0
     model: str = "ltx-video"
     seed: int = 42
 
@@ -118,29 +137,37 @@ class VideoReq(BaseModel):
 @app.get("/health")
 def health(x_api_key: Optional[str] = Header(default=None)):
     _auth(x_api_key)
-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    vram_gb = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1) if torch.cuda.is_available() else 0
-    return {"status": "ok", "gpu": gpu_name, "vram_gb": vram_gb, "loaded_video_model": _VID_MODEL_ID}
+    cnt = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    gpu_name = f"{torch.cuda.get_device_name(0)} x{cnt}" if cnt > 0 else "CPU"
+    vram_gb = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1) if cnt > 0 else 0
+    return {
+        "status": "ok",
+        "version": WORKER_VERSION,
+        "gpu": gpu_name,
+        "vram_gb": vram_gb,
+        "loaded_video_model": _VID_MODEL_ID,
+    }
 
 
 @app.post("/generate-image")
 def generate_image(req: ImageReq, x_api_key: Optional[str] = Header(default=None)):
     _auth(x_api_key)
-    pipe = _get_image_pipe()
-    gen = torch.Generator("cuda").manual_seed(req.seed)
-    w = (req.width // 64) * 64
-    h = (req.height // 64) * 64
-    img = pipe(
-        prompt=req.prompt,
-        negative_prompt=req.negative_prompt,
-        width=w,
-        height=h,
-        num_inference_steps=4,
-        guidance_scale=0.0,
-        generator=gen,
-    ).images[0]
-    pipe.to("cpu")
-    _free_vram()
+    with _LOCK:
+        pipe = _get_image_pipe()
+        gen = torch.Generator("cuda:0").manual_seed(req.seed)
+        w = max(384, min(512, (req.width // 64) * 64))
+        h = max(384, min(896, (req.height // 64) * 64))
+        # Truncate prompt to <= 60 words so CLIP 77-token limit never drops key details
+        short_prompt = " ".join(req.prompt.split()[:60])
+        img = pipe(
+            prompt=short_prompt,
+            width=w,
+            height=h,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            generator=gen,
+        ).images[0]
+        _unload_image_pipe()
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return {"image_base64": base64.b64encode(buf.getvalue()).decode("ascii")}
@@ -150,34 +177,37 @@ def _run_video_worker(job_id: str, req: VideoReq) -> None:
     try:
         from diffusers.utils import export_to_video
 
-        w = max(384, min(448, (req.width // 32) * 32))
-        h = max(384, min(768, (req.height // 32) * 32))
-        raw_img = Image.open(io.BytesIO(base64.b64decode(req.image_base64))).convert("RGB")
-        raw_img = raw_img.resize((w, h))
+        with _LOCK:
+            w = max(320, min(416, (req.width // 32) * 32))
+            h = max(320, min(704, (req.height // 32) * 32))
+            raw_img = Image.open(io.BytesIO(base64.b64decode(req.image_base64))).convert("RGB")
+            raw_img = raw_img.resize((w, h))
 
-        pipe = _get_video_pipe(req.model)
-        gen = torch.Generator("cpu").manual_seed(req.seed)
-        num_frames = 49
-        fps = 8
+            pipe = _get_video_pipe(req.model)
+            gen = torch.Generator("cpu").manual_seed(req.seed)
+            num_frames = 33  # 8*4 + 1 frames -> fast & low VRAM on T4
+            fps = 8
+            short_prompt = " ".join(req.prompt.split()[:60])
 
-        out = pipe(
-            image=raw_img,
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            width=w,
-            height=h,
-            num_frames=num_frames,
-            num_inference_steps=20,
-            generator=gen,
-        )
-        frames = out.frames[0]
-        with tempfile.TemporaryDirectory() as tmp:
-            mp4_path = Path(tmp) / "clip.mp4"
-            export_to_video(frames, str(mp4_path), fps=fps)
-            b64 = base64.b64encode(mp4_path.read_bytes()).decode("ascii")
+            with torch.inference_mode():
+                out = pipe(
+                    image=raw_img,
+                    prompt=short_prompt,
+                    negative_prompt=req.negative_prompt,
+                    width=w,
+                    height=h,
+                    num_frames=num_frames,
+                    num_inference_steps=18,
+                    generator=gen,
+                )
+            frames = out.frames[0]
+            with tempfile.TemporaryDirectory() as tmp:
+                mp4_path = Path(tmp) / "clip.mp4"
+                export_to_video(frames, str(mp4_path), fps=fps)
+                b64 = base64.b64encode(mp4_path.read_bytes()).decode("ascii")
 
-        _free_vram()
-        _VIDEO_JOBS[job_id] = {"status": "done", "video_base64": b64}
+            _free_vram()
+            _VIDEO_JOBS[job_id] = {"status": "done", "video_base64": b64}
     except Exception as exc:
         _free_vram()
         _VIDEO_JOBS[job_id] = {"status": "error", "error": str(exc)}

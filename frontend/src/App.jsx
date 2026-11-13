@@ -16,6 +16,7 @@ export default function App() {
   const [language, setLanguage] = useState('id')
   const [voiceId, setVoiceId] = useState('id-ID-ArdiNeural')
   const [voices, setVoices] = useState([])
+  const [renderMode, setRenderMode] = useState('hybrid_stickman')
 
   // LLM optional config
   const [llmProvider, setLlmProvider] = useState('builtin')
@@ -51,7 +52,7 @@ export default function App() {
         const r = await fetch(`/api/jobs/${job.job_id}`)
         if (r.ok) setJob(await r.json())
       } catch {}
-    }, 2000)
+    }, 1500)
     return () => clearInterval(timer)
   }, [job])
 
@@ -125,6 +126,7 @@ export default function App() {
           video_model: videoModel,
           image_model: imageModel,
         },
+        render_mode: renderMode,
         burn_subtitles: burnSubtitles,
         normalize_loudness: normalizeLoudness,
         fallback_local_render: fallbackLocal,
@@ -143,27 +145,43 @@ export default function App() {
         <div>
           <h1>🎬 Stickman Hybrid Studio</h1>
           <p className="subtitle">
-            Pipeline Otomatis: Storyboard → Keyframe & I2V (Kaggle T4 x2) → Voiceover & SFX → Subtitle & Export MP4
+            Multi-Beat Storyboard (3 Beat/10s) → Hybrid Stickman 24fps + Kaggle GPU → Edge-TTS & SFX → Subtitle Pendek & Export MP4
           </p>
         </div>
         <div className="row">
           {pingResult?.ok ? (
-            <span className="pill ok">Kaggle GPU: {pingResult.worker?.gpu || 'Terhubung'}</span>
+            <span className="pill ok">
+              Kaggle GPU: {pingResult.worker?.gpu || 'Terhubung'} ({pingResult.worker?.version || 'v1'})
+            </span>
           ) : (
-            <span className="pill">Kaggle GPU: Belum terhubung (bisa pakai fallback)</span>
+            <span className="pill">Kaggle GPU: Opsional / Lokal Siap</span>
           )}
         </div>
       </header>
 
       {/* STEP 1 */}
       <section className="card">
-        <h2>1. Pengaturan Proyek & Koneksi Kaggle GPU</h2>
+        <h2>1. Pengaturan Proyek & Engine Visual</h2>
         <div style={{ marginBottom: 14 }}>
           <label>Topik / Ide Cerita</label>
           <textarea value={topic} onChange={(e) => setTopic(e.target.value)} />
         </div>
 
         <div className="grid-2" style={{ marginBottom: 14 }}>
+          <div>
+            <label>Mode Engine Visual</label>
+            <select value={renderMode} onChange={(e) => setRenderMode(e.target.value)}>
+              <option value="hybrid_stickman">
+                ⭐ Hybrid: Background AI Kaggle + Animasi Stickman 2D 24fps (Karakter Konsisten)
+              </option>
+              <option value="stickman_2d">
+                ⚡ Stickman 2D Animator 24fps (100% Lokal & Cepat Tanpa Kaggle)
+              </option>
+              <option value="full_ai">
+                🧪 Full AI Video Kaggle (SDXL-Turbo + LTX-Video I2V)
+              </option>
+            </select>
+          </div>
           <div>
             <label>Gaya Visual</label>
             <select value={style} onChange={(e) => setStyle(e.target.value)}>
@@ -180,12 +198,11 @@ export default function App() {
             </select>
           </div>
           <div>
-            <label>Durasi Target</label>
+            <label>Durasi Target (3 Beat per 10 Detik)</label>
             <select value={durationSec} onChange={(e) => setDurationSec(Number(e.target.value))}>
-              <option value={10}>10 detik (1 klip)</option>
-              <option value={20}>20 detik (2 klip)</option>
-              <option value={30}>30 detik (3 klip)</option>
-              <option value={60}>60 detik (6 klip)</option>
+              <option value={10}>10 detik (3 Beat Dinamis)</option>
+              <option value={20}>20 detik (6 Beat Dinamis)</option>
+              <option value={30}>30 detik (9 Beat Dinamis)</option>
             </select>
           </div>
           <div>
@@ -206,55 +223,48 @@ export default function App() {
               ))}
             </select>
           </div>
-        </div>
-
-        <div className="grid-2" style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
-          <div>
-            <label>Kaggle Tunnel URL (dari Notebook `stickman_kaggle_worker.ipynb`)</label>
-            <input
-              placeholder="https://xxxx-xxxx.trycloudflare.com"
-              value={kaggleUrl}
-              onChange={(e) => setKaggleUrl(e.target.value)}
-            />
-          </div>
-          <div>
-            <label>Model Video di Kaggle T4 x2</label>
-            <select value={videoModel} onChange={(e) => setVideoModel(e.target.value)}>
-              <option value="ltx-video">LTX-Video I2V (Cepat, T4 Friendly)</option>
-              <option value="wan2.1-i2v">Wan 2.1 I2V (Kualitas Tinggi, Lebih Berat)</option>
-            </select>
-          </div>
           <div>
             <label>Penulis Naskah AI (Opsional)</label>
             <select value={llmProvider} onChange={(e) => setLlmProvider(e.target.value)}>
-              <option value="builtin">Template Bawaan (Gratis Tanpa API Key)</option>
+              <option value="builtin">Smart Multi-Beat Story Engine (Gratis Tanpa API Key)</option>
               <option value="gemini">Gemini API (Gratis / Free Tier)</option>
               <option value="openai_compatible">OpenAI-Compatible (Groq / OpenRouter / dll)</option>
             </select>
           </div>
-          {llmProvider !== 'builtin' && (
+        </div>
+
+        {renderMode !== 'stickman_2d' && (
+          <div className="grid-2" style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
             <div>
-              <label>LLM API Key</label>
+              <label>Kaggle Tunnel URL (dari Notebook Cell 2)</label>
               <input
-                type="password"
-                placeholder="Masukkan API Key..."
-                value={llmApiKey}
-                onChange={(e) => setLlmApiKey(e.target.value)}
+                placeholder="https://xxxx-xxxx.trycloudflare.com"
+                value={kaggleUrl}
+                onChange={(e) => setKaggleUrl(e.target.value)}
               />
             </div>
-          )}
-        </div>
+            <div>
+              <label>Model Video di Kaggle T4 x2 (untuk Mode Full AI)</label>
+              <select value={videoModel} onChange={(e) => setVideoModel(e.target.value)}>
+                <option value="ltx-video">LTX-Video I2V (Sequential Offload, T4 Friendly)</option>
+                <option value="wan2.1-i2v">Wan 2.1 I2V (Lebih Berat)</option>
+              </select>
+            </div>
+          </div>
+        )}
 
         <div className="row">
           <button className="btn" onClick={handleGenerateStoryboard} disabled={loadingSb}>
-            {loadingSb ? 'Menyusun...' : '1. Buat Storyboard & Prompt'}
+            {loadingSb ? 'Menyusun...' : '1. Buat Storyboard Multi-Beat'}
           </button>
-          <button className="btn btn-secondary" onClick={handlePing}>
-            Test Koneksi Kaggle
-          </button>
+          {renderMode !== 'stickman_2d' && (
+            <button className="btn btn-secondary" onClick={handlePing}>
+              Test Koneksi Kaggle
+            </button>
+          )}
           {pingResult && !pingResult.loading && (
             <span className={`pill ${pingResult.ok ? 'ok' : 'err'}`}>
-              {pingResult.ok ? 'Terhubung!' : `Gagal: ${pingResult.error}`}
+              {pingResult.ok ? `Terhubung (${pingResult.worker?.version || 'v1'})!` : `Gagal: ${pingResult.error}`}
             </span>
           )}
         </div>
@@ -263,30 +273,25 @@ export default function App() {
       {/* STEP 2 */}
       {storyboard && (
         <section className="card">
-          <h2>2. Review & Edit Storyboard ({storyboard.scenes.length} Klip)</h2>
-          <div className="grid-2" style={{ marginBottom: 14 }}>
-            <div>
-              <label>Character Lock</label>
-              <textarea
-                value={storyboard.character_lock}
-                onChange={(e) => setStoryboard({ ...storyboard, character_lock: e.target.value })}
-              />
-            </div>
-            <div>
-              <label>Style Anchor</label>
-              <textarea
-                value={storyboard.style_anchor}
-                onChange={(e) => setStoryboard({ ...storyboard, style_anchor: e.target.value })}
-              />
-            </div>
-          </div>
+          <h2>2. Review & Edit Storyboard ({storyboard.scenes.length} Beat — Total {storyboard.duration_sec}s)</h2>
 
           {storyboard.scenes.map((sc, i) => (
             <div className="scene-card" key={sc.index}>
-              <strong>Scene {sc.index}: {sc.title} ({sc.duration_sec}s)</strong>
-              <div className="grid-2" style={{ marginTop: 10 }}>
+              <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+                <strong>Beat {sc.index}: {sc.title} ({sc.duration_sec}s)</strong>
+                <select
+                  style={{ width: 220 }}
+                  value={sc.action_type || 'creep'}
+                  onChange={(e) => updateScene(i, 'action_type', e.target.value)}
+                >
+                  <option value="creep">Aksi: Mengendap / Jalan (Creep)</option>
+                  <option value="charge">Aksi: Gemetar & Serbu + Zoom (Charge)</option>
+                  <option value="reveal">Aksi: Twist Kelinci & Tatapan Datar (Reveal)</option>
+                </select>
+              </div>
+              <div className="grid-2">
                 <div>
-                  <label>Narasi (Voiceover) & Subtitle</label>
+                  <label>Narasi Voiceover & Subtitle (otomatis dipotong per 4–5 kata)</label>
                   <textarea
                     value={sc.vo_text}
                     onChange={(e) => {
@@ -296,7 +301,7 @@ export default function App() {
                   />
                 </div>
                 <div>
-                  <label>Prompt Gambar & Animasi (Inggris)</label>
+                  <label>Prompt Visual (untuk AI Background / I2V)</label>
                   <textarea
                     value={sc.image_prompt}
                     onChange={(e) => updateScene(i, 'image_prompt', e.target.value)}
@@ -309,15 +314,11 @@ export default function App() {
           <div className="row" style={{ marginBottom: 14 }}>
             <label className="checkbox-row">
               <input type="checkbox" checked={burnSubtitles} onChange={(e) => setBurnSubtitles(e.target.checked)} />
-              Burn-in Subtitle (Zona Aman Shorts)
+              Burn-in Subtitle Pendek (Zona Aman Shorts)
             </label>
             <label className="checkbox-row">
               <input type="checkbox" checked={normalizeLoudness} onChange={(e) => setNormalizeLoudness(e.target.checked)} />
               Normalisasi Audio (-14 LUFS)
-            </label>
-            <label className="checkbox-row">
-              <input type="checkbox" checked={fallbackLocal} onChange={(e) => setFallbackLocal(e.target.checked)} />
-              Fallback Renderer Otomatis jika Kaggle Offline
             </label>
           </div>
 
@@ -345,9 +346,9 @@ export default function App() {
 
           {job.scene_images.length > 0 && (
             <>
-              <h3 style={{ marginTop: 16, fontSize: '0.95rem' }}>Keyframe Gambar</h3>
+              <h3 style={{ marginTop: 16, fontSize: '0.95rem' }}>Preview Beat ({job.scene_images.length} Adegan)</h3>
               <div className="media-grid">
-                {job.scene_images.map((src, i) => <img key={i} src={src} alt={`Scene ${i + 1}`} />)}
+                {job.scene_images.map((src, i) => <img key={i} src={src} alt={`Beat ${i + 1}`} />)}
               </div>
             </>
           )}

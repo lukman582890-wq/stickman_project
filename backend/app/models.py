@@ -17,6 +17,12 @@ class AspectRatio(str, Enum):
     LANDSCAPE_16_9 = "16:9"
 
 
+class RenderMode(str, Enum):
+    HYBRID_STICKMAN = "hybrid_stickman"
+    FULL_AI = "full_ai"
+    STICKMAN_2D = "stickman_2d"
+
+
 class WorkerConfig(BaseModel):
     kaggle_url: str = Field(default="", description="Cloudflare/ngrok tunnel URL from Kaggle notebook")
     api_key: str = Field(default="", description="Optional shared secret for Kaggle worker")
@@ -43,7 +49,8 @@ class StoryboardRequest(BaseModel):
 
 class SceneBeat(BaseModel):
     index: int
-    duration_sec: int = 10
+    duration_sec: float = 3.5
+    action_type: str = "creep"  # creep | charge | reveal
     title: str
     visual_description: str
     image_prompt: str
@@ -70,17 +77,10 @@ class Storyboard(BaseModel):
 class ProduceRequest(BaseModel):
     storyboard: Storyboard
     worker: WorkerConfig
+    render_mode: RenderMode = RenderMode.HYBRID_STICKMAN
     burn_subtitles: bool = True
     normalize_loudness: bool = True
     fallback_local_render: bool = True
-
-
-class JobStepState(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
-    SKIPPED = "skipped"
 
 
 class JobStatus(BaseModel):

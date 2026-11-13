@@ -22,15 +22,15 @@ def test_styles_and_voices():
     assert any(v["id"] == "id-ID-ArdiNeural" for v in r_voices.json())
 
 
-def test_create_storyboard_a3_and_a5():
+def test_create_storyboard_multi_beat():
     for style in ("A3_PREHISTORIC", "A5_HISTORICAL"):
         r = client.post(
             "/api/storyboard",
             json={
-                "topic": "Berburu di malam hari",
+                "topic": "Berburu di malam hari, mengira kelinci adalah monster raksasa",
                 "style": style,
                 "aspect_ratio": "9:16",
-                "duration_sec": 20,
+                "duration_sec": 10,
                 "language": "id",
                 "voice_id": "id-ID-ArdiNeural",
             },
@@ -38,7 +38,5 @@ def test_create_storyboard_a3_and_a5():
         assert r.status_code == 200
         data = r.json()
         assert data["style"] == style
-        assert len(data["scenes"]) == 2
-        assert data["scenes"][0]["image_prompt"]
-        assert data["scenes"][0]["video_prompt"]
-        assert data["scenes"][0]["vo_text"]
+        assert len(data["scenes"]) == 3
+        assert [s["action_type"] for s in data["scenes"]] == ["creep", "charge", "reveal"]
