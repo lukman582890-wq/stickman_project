@@ -1,7 +1,8 @@
 """Kaggle T4 x2 GPU Worker for Stickman Hybrid Studio.
-Uses async background jobs for /generate-video so Cloudflare Tunnel (100s timeout) never returns 524.
+Uses async background jobs for /generate-video + aggressive VRAM offloading for 15GB T4.
 """
 import base64
+import gc
 import io
 import os
 import tempfile
@@ -9,6 +10,8 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Optional
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from fastapi import FastAPI, Header, HTTPException
@@ -29,8 +32,20 @@ def _auth(x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
 
 
+def _free_vram() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _get_image_pipe():
-    global _IMG_PIPE
+    global _IMG_PIPE, _VID_PIPE, _VID_MODEL_ID
+    if _VID_PIPE is not None:
+        del _VID_PIPE
+        _VID_PIPE = None
+        _VID_MODEL_ID = None
+        _free_vram()
+
     if _IMG_PIPE is None:
         from diffusers import AutoPipelineForText2Image
         _IMG_PIPE = AutoPipelineForText2Image.from_pretrained(
@@ -38,35 +53,42 @@ def _get_image_pipe():
             torch_dtype=torch.float16,
             variant="fp16",
         )
-        _IMG_PIPE.to("cuda")
+    _IMG_PIPE.to("cuda")
     return _IMG_PIPE
 
 
 def _get_video_pipe(model_choice: str):
-    global _VID_PIPE, _VID_MODEL_ID
+    global _IMG_PIPE, _VID_PIPE, _VID_MODEL_ID
+    if _IMG_PIPE is not None:
+        _IMG_PIPE.to("cpu")
+        _free_vram()
+
     if _VID_PIPE is not None and _VID_MODEL_ID == model_choice:
         return _VID_PIPE
 
     if _VID_PIPE is not None:
         del _VID_PIPE
-        torch.cuda.empty_cache()
+        _free_vram()
 
     if model_choice == "wan2.1-i2v":
         from diffusers import WanImageToVideoPipeline
         pipe = WanImageToVideoPipeline.from_pretrained(
             "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,
         )
     else:
         from diffusers import LTXImageToVideoPipeline
         pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,
         )
 
-    pipe.enable_model_cpu_offload()
-    if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
-        pipe.vae.enable_tiling()
+    pipe.enable_sequential_cpu_offload()
+    if hasattr(pipe, "vae"):
+        if hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+        if hasattr(pipe.vae, "enable_slicing"):
+            pipe.vae.enable_slicing()
 
     _VID_PIPE = pipe
     _VID_MODEL_ID = model_choice
@@ -117,6 +139,8 @@ def generate_image(req: ImageReq, x_api_key: Optional[str] = Header(default=None
         guidance_scale=0.0,
         generator=gen,
     ).images[0]
+    pipe.to("cpu")
+    _free_vram()
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return {"image_base64": base64.b64encode(buf.getvalue()).decode("ascii")}
@@ -126,15 +150,15 @@ def _run_video_worker(job_id: str, req: VideoReq) -> None:
     try:
         from diffusers.utils import export_to_video
 
-        w = max(384, min(512, (req.width // 32) * 32))
+        w = max(384, min(448, (req.width // 32) * 32))
         h = max(384, min(768, (req.height // 32) * 32))
         raw_img = Image.open(io.BytesIO(base64.b64decode(req.image_base64))).convert("RGB")
         raw_img = raw_img.resize((w, h))
 
         pipe = _get_video_pipe(req.model)
         gen = torch.Generator("cpu").manual_seed(req.seed)
-        num_frames = 65 if req.model == "ltx-video" else 49
-        fps = 8 if req.model == "ltx-video" else 12
+        num_frames = 49
+        fps = 8
 
         out = pipe(
             image=raw_img,
@@ -152,8 +176,10 @@ def _run_video_worker(job_id: str, req: VideoReq) -> None:
             export_to_video(frames, str(mp4_path), fps=fps)
             b64 = base64.b64encode(mp4_path.read_bytes()).decode("ascii")
 
+        _free_vram()
         _VIDEO_JOBS[job_id] = {"status": "done", "video_base64": b64}
     except Exception as exc:
+        _free_vram()
         _VIDEO_JOBS[job_id] = {"status": "error", "error": str(exc)}
 
 
